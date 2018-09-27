@@ -17,3 +17,5 @@ Whale Wise: minimising human disturbance to cetaceans
 www.whalewise.org
 
 @whalewise (Faceboook & Instagram)
+
+Time span: 2018-2022
