@@ -1,0 +1,189 @@
+##############################
+### BOOTSTRAP GAM: DI, AIS ###
+##############################
+### 17/09/2023
+### Tom Grove
+### tomgrove20@yahoo.co.uk
+
+
+### PACKAGES
+packages <- c("tidyverse", "ppcor","RColorBrewer", "scales","survMisc", "Metrics", "corrplot", "lme4", "MASS", "mgcv", "tidymv", "mgcViz", "gridExtra", "gratia", "ggcorrplot", "cowplot", "ggpubr", "parallel", "foreach")
+new.packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(packages, require, character.only = TRUE)
+
+
+#---------------- FUNCTIONS + THEME --------------------
+source("code/functions.R")
+source("code/themes.R")
+
+
+#---------------- DATA --------------------
+
+# AIS
+tot <- read.csv("intermediate-products/response-var-dfs/di_ais.csv") %>%
+  mutate(datetime = as.POSIXct(datetime)) %>%
+  mutate_at(.vars = c("group", "seastate", "year", "folnum.unique", "surface.feeding", "surface.active"), as.factor) %>%
+  mutate(dummy = 1) # important dummy variable to factor out random effect when predicting response
+
+# creating new transformed columns
+tot <- tot %>%
+  mutate(arcsin.DI = asin(DI),
+         across(contains(c("meandist", "dist.max")), .fns = list(sqrt = ~sqrt(.)), .names = "{fn}.{col}"), # sqrt
+         across(contains(c("difftime")), .fns = list(log = ~log(.)), .names = "{fn}.{col}")) # sqrt dist max
+
+# now we need to create AR.start (defining the start of each follow to group AR structure) and join this to tot (to enable sampling)
+ar.start <- (tot %>% group_by(folnum.unique) %>% mutate(n = row_number()) %>% 
+               mutate(ar.start = ifelse(n == min(n), TRUE, FALSE)))$ar.start
+tot <- mutate(tot, ar.start = ar.start)
+
+# bootstrapped speeds
+  di.boot <- read.csv("intermediate-products/bootstrap/bootstrap-DI.csv") %>%
+  mutate(datetime = as.POSIXct(datetime))
+
+# model
+gam <- readRDS("intermediate-products/gam-v3/di/ais/gam_di_ais_final_v3.rds")
+
+
+#---------------- BOOTSTRAP --------------------
+
+# formula
+var.fac = c("group", "seastate", "surface.feeding", "surface.active")
+var.int = c("rib.num.30.1500")
+var.num = c("log.difftime.prev")
+var.rand = c("folnum.unique")
+f <- as.formula(paste("arcsin.DI ~", 
+                      paste("s(",var.int,", bs = 'cs', k = 3)", collapse = "+"),"+",
+                      paste("s(",var.num,", bs = 'cs', k = 10)", collapse= "+"),"+",
+                      paste(var.fac, collapse = "+"), "+",
+                      paste("s(",var.rand,", bs = 're', by = dummy)", collapse = "+")))
+
+
+# how many cores do we have? 
+parallel::detectCores() # 8 cores!
+n.cores = 5 # let's use 5 for now
+
+# creating cluster of cores
+my.cluster <- parallel::makeCluster(
+  n.cores, 
+  type = "PSOCK"
+)
+print(my.cluster)
+
+#register it to be used by %dopar%
+doParallel::registerDoParallel(cl = my.cluster)
+
+#check if it is registered (optional)
+foreach::getDoParRegistered()
+
+# define parameters first
+it = 500 # number of iterations
+
+# create empty data frame to populate
+
+v.line <- names(summary(gam)$p.coeff)[-1]
+v.smooth <- gsub("s\\(|\\)","",names(summary(gam)$chi.sq))
+di.ais.boot <- data.frame(matrix(ncol = (length(v.line)+length(v.smooth))*2, nrow = 0)) 
+names(di.ais.boot) = c(paste0(v.line,"_estimate"), paste0(v.line,"_p"),
+                       paste0(v.smooth,"_edf"), paste0(v.smooth,"_p")) 
+
+
+di.ais.boot <- foreach(i = 1:it, .combine = rbind, .errorhandling = 'remove', .packages = c("tidyverse", "mgcv"), .inorder = FALSE) %dopar% {
+  
+  # replace DI with iteration
+  sample <- tot %>% left_join(di.boot %>% dplyr::select(datetime, move.id.tot, paste0("DI",i))) %>%
+    dplyr::select(-arcsin.DI) %>% rename(arcsin.DI = paste0("DI",i)) %>%
+    mutate(arcsin.DI = asin(arcsin.DI))
+  
+  # now run the model
+  g <- do.call("bam", list(as.formula(f), data=as.name("sample"), method = "REML", 
+                             family = gaussian(link = "identity"), rho = 0.18, start = ar.start))
+  summary <- summary(g)
+  
+  # now extracting important bits!
+  line.coeff <- t(as.data.frame(summary$p.coeff)); rownames(line.coeff) = NULL; colnames(line.coeff) = paste0(colnames(line.coeff),"_estimate")
+  line.p <- t(as.data.frame(summary$p.pv)); rownames(line.p) = NULL; colnames(line.p) = paste0(colnames(line.p),"_p")
+  
+  smooth.names <- gsub("s\\(|\\)","",names(summary$chi.sq))
+  smooth.edf <- t(as.data.frame(summary$edf)); rownames(smooth.edf) = NULL; colnames(smooth.edf) = paste0(smooth.names,"_estimate")
+  smooth.p <- t(as.data.frame(summary$s.pv)); rownames(smooth.p) = NULL; colnames(smooth.p) = paste0(smooth.names,"_p")
+  
+  df <- cbind(line.coeff, line.p, smooth.edf, smooth.p)
+  
+  x <- "x"
+  write.csv(x, paste0("intermediate-products/progress-checker/interation ",i,".csv"))
+  
+  return(df)
+  
+}
+
+di.ais.boot <- as.data.frame(di.ais.boot)
+ggplot(data = di.ais.boot, aes(x = rib.num.30.1500_p)) + geom_histogram()
+
+write.csv(di.ais.boot, "intermediate-products/gam-v3/di/ais/di_ais_boot-res_v3.csv")
+# always stop the cluster
+parallel::stopCluster(cl = my.cluster)
+
+
+#---------------- PLOTTING --------------------
+
+#di.ais.boot <- read.csv("intermediate-products/gam-v3/di/ais/di_ais_boot-res_v3.csv")
+
+# first a df for naming
+var.fac = c("seastatechoppy", "grouplone", "surface.active1", "surface.feeding1")
+var.num = c("log.difftime.prev", "rib.num.30.1500")
+
+names <- c("Sea state", "Group type", "Surface active", "Surface feeding", "IBI before", "Number of RIBs")
+
+name.df <- data.frame(
+  var = c(var.fac, var.num),
+  name = factor(names, levels = names)) %>%
+  mutate(type = ifelse(var %in% var.fac, "fac","num"))
+
+# we need to create a df from the original GAM so we can add lines for full model effect sizes
+summary <- summary(gam)
+line.coeff <- as.data.frame(summary$p.coeff) %>% add_rownames(var = "var") %>% rename(val = 2)
+smooth.names <- gsub("s\\(|\\)","",names(summary$chi.sq))
+smooth.edf <- as.data.frame(summary$edf) %>% mutate(var = smooth.names) %>% rename(val = 1)
+orig.df <- as.data.frame(bind_rows(line.coeff, smooth.edf)) %>% left_join(name.df)
+# note: right now, this doesn't make sense because sample sizes are quite different. We're just seeing how spread out they are
+
+# what percentage of runs had p<0.05?
+p.df <- di.ais.boot %>% gather(key = "var", value = "p", contains("_p")) %>%
+  mutate(var = gsub("_p","",var)) %>%
+  group_by(var) %>%
+  summarise(p.90 = paste0((sum(p<=0.004)/n())*100, "%  p<0.004   ")) %>%
+  left_join(name.df)
+
+plot.df <- di.ais.boot %>% gather(key = "var", value = "val", contains("estimate")) %>%
+  mutate(var = gsub("_estimate","",var)) %>% left_join(name.df)
+
+# first plotting factor vars
+(pfac <- plot.df %>% drop_na(name) %>% filter(type == "fac") %>% ggplot() +
+    geom_histogram(aes(x = val, color = name, fill = name), alpha = 0.4, bins = 60) +
+    geom_text(data = p.df %>% filter(type == "fac"), aes(x = Inf, y = Inf, label = p.90),  
+              vjust = 1.5,hjust = 1, size = 3) +
+    geom_vline(data = orig.df %>% filter(type == "fac"), aes(xintercept = val), linetype = "dashed", alpha = 0.5) +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(length(var.fac), "Set1")[-6]) +
+    scale_color_manual(values = RColorBrewer::brewer.pal(length(var.fac), "Set1")[-6]) +  
+    facet_wrap(~name, ncol = 1) +
+    labs(x = "Estimate", y = "Count", title = "Linear terms") +
+    plot.theme + theme(legend.position = "none", plot.title = element_text(hjust = 0.5)))
+
+# then smooth vars
+(pnum <- plot.df %>% drop_na(name) %>% filter(type == "num") %>% ggplot() +
+    geom_histogram(aes(x = val, color = name, fill = name), alpha = 0.4, bins = 60) +
+    geom_text(data = p.df %>% filter(type == "num"), aes(x = Inf, y = Inf, label = p.90),  
+              vjust = 1.5,hjust = 1, size = 3) +
+    geom_vline(data = orig.df %>% filter(type == "num"), aes(xintercept = val), linetype = "dashed", alpha = 0.5) +
+    scale_fill_brewer(palette = "Dark2") + scale_color_brewer(palette = "Dark2") +
+    facet_wrap(~name, ncol = 1) +
+    labs(x = "EDF", y = "Count", title = "Smooth terms") +
+    plot.theme + theme(legend.position = "none", plot.title = element_text(hjust = 0.5)))
+
+
+# now try both together
+plot_grid(
+  pfac,
+  plot_grid(pnum,NULL, ncol = 1, rel_heights = c(1.27,1)))
+ggsave("intermediate-products/gam-v3/di/ais/di_ais_boot_res_v3.png", height = 8, width = 7)
